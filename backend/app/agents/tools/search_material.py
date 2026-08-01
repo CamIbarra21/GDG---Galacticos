@@ -1,16 +1,18 @@
 """
 Tool del agente ADK: busca material educativo en la base de conocimiento
-construida localmente a partir de los PDFs (ver app/services/knowledge_base.py
-y app/scripts/build_kb.py).
+construida localmente a partir de los PDFs.
 
-Esta tool trabaja 100% contra el índice local (sin llamadas externas), para
-que el modo "local" siga siendo genuinamente offline.
+IMPORTANTE: el grado del estudiante NO se le pide a Gemma como argumento
+(el modelo no tiene forma confiable de saberlo). En cambio, se inyecta
+automáticamente vía ToolContext, a partir del estado de la sesión que el
+backend define al crear la sesión de chat (ver app/api/routes/chat.py).
 """
+
+from google.adk.tools import ToolContext
 
 from app.services import knowledge_base
 
-
-def buscar_material(consulta: str) -> dict:
+def buscar_material(consulta: str, tool_context: ToolContext) -> dict:
     """Busca en el material educativo local (extraído de los cuadernillos PDF)
     fragmentos relevantes para responder la pregunta del estudiante.
 
@@ -19,25 +21,30 @@ def buscar_material(consulta: str) -> dict:
             por ejemplo "¿qué es una fracción?" o "sumas con llevada".
 
     Returns:
-        dict: status ("success" o "not_found") y una lista de fragmentos
-            encontrados, cada uno con su texto, tema, materia, grado y
-            el archivo/página de origen (para poder citar la fuente).
+        dict: status y datos según el caso:
+          - "success": hay fragmentos relevantes en "fragmentos".
+          - "grado_sin_material": no hay NINGÚN material cargado para el
+            grado de este estudiante todavía (independiente de la pregunta).
+          - "not_found": sí hay material para su grado, pero nada relevante
+            para esta pregunta en particular.
     """
-    try:
-        resultados = knowledge_base.search(consulta, top_k=3)
-    except FileNotFoundError as e:
+    grado_estudiante = tool_context.state.get("grado")
+
+    resultado = knowledge_base.search(consulta, top_k=3, grado=grado_estudiante)
+
+    if resultado["status"] == "grado_sin_material":
         return {
-            "status": "error",
+            "status": "grado_sin_material",
             "message": (
-                "El índice de materiales aún no ha sido construido. "
-                f"Detalle: {e}"
+                f"Todavía no hay material educativo cargado para el grado "
+                f"'{grado_estudiante}'. Avísale a tu profesor."
             ),
         }
 
-    if not resultados:
+    if resultado["status"] == "not_found":
         return {
             "status": "not_found",
-            "message": f"No se encontró material local relacionado con: '{consulta}'.",
+            "message": f"No se encontró material relacionado con: '{consulta}'.",
         }
 
     return {
@@ -50,6 +57,6 @@ def buscar_material(consulta: str) -> dict:
                 "grado": r["grado"],
                 "fuente": f"{r['archivo']}, página {r['pagina']}",
             }
-            for r in resultados
+            for r in resultado["resultados"]
         ],
     }

@@ -197,9 +197,30 @@ def load_index(index_path: Path = INDEX_PATH) -> dict:
 
 _cached_index = None
 
+def normalizar_grado(texto: str) -> str:
+    """
+    Convierte 'Primero de primaria' -> 'primaria_primero'
+    """
+    partes = texto.lower().split()
+    # Asumimos que el formato siempre es "<grado> de <nivel>"
+    if len(partes) >= 3 and partes[1] == "de":
+        grado = partes[0]       # primero, segundo, tercero...
+        nivel = partes[2]       # primaria, secundaria...
+        return f"{nivel}_{grado}"
+    return texto.lower().replace(" ", "_")
 
-def search(query: str, top_k: int = 3, index_path: Path = INDEX_PATH) -> list[dict]:
-    """Busca los chunks más relevantes para una consulta del estudiante."""
+def search(query: str, top_k: int = 3, grado: str | None = None, index_path: Path = INDEX_PATH) -> dict:
+    """Busca los chunks más relevantes para una consulta del estudiante.
+
+    Si se especifica `grado`, la búsqueda se limita SOLO a los chunks de
+    ese grado. Si no hay ningún material registrado para ese grado (sin
+    importar la pregunta), se informa explícitamente en vez de devolver
+    contenido de otro nivel.
+
+    Devuelve un dict con:
+      - status: "success" | "grado_sin_material" | "not_found"
+      - resultados: lista de chunks (solo si status == "success")
+    """
     global _cached_index
     if _cached_index is None:
         _cached_index = load_index(index_path)
@@ -209,18 +230,33 @@ def search(query: str, top_k: int = 3, index_path: Path = INDEX_PATH) -> list[di
     chunks = _cached_index["chunks"]
 
     if vectorizer is None or not chunks:
-        return []
+        return {"status": "not_found", "resultados": []}
 
+    # Filtra primero por grado (si se pidió), ANTES de mirar similitud de texto.
+    if grado is not None:
+        print(grado)
+        grado_normalizado = normalizar_grado(grado)
+        indices_grado = [i for i, c in enumerate(chunks) if c["grado"] == grado_normalizado]
+        if not indices_grado:
+            return {"status": "grado_sin_material", "resultados": []}
+    else:
+        indices_grado = list(range(len(chunks)))
+
+    submatrix = matrix[indices_grado]
     query_vec = vectorizer.transform([query])
-    similitudes = cosine_similarity(query_vec, matrix).flatten()
+    similitudes = cosine_similarity(query_vec, submatrix).flatten()
 
-    top_indices = similitudes.argsort()[::-1][:top_k]
+    orden_local = similitudes.argsort()[::-1][:top_k]
     resultados = []
-    for i in top_indices:
-        if similitudes[i] <= 0:
+    for pos in orden_local:
+        if similitudes[pos] <= 0:
             continue
-        resultado = dict(chunks[i])
-        resultado["score"] = float(similitudes[i])
+        idx_real = indices_grado[pos]
+        resultado = dict(chunks[idx_real])
+        resultado["score"] = float(similitudes[pos])
         resultados.append(resultado)
 
-    return resultados
+    if not resultados:
+        return {"status": "not_found", "resultados": []}
+
+    return {"status": "success", "resultados": resultados}
