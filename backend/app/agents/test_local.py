@@ -31,7 +31,8 @@ async def preguntar(runner: Runner, texto: str) -> str:
         user_id=USER_ID, session_id=SESSION_ID, new_message=contenido
     ):
         if event.is_final_response() and event.content and event.content.parts:
-            respuesta_final = event.content.parts[0].text
+            #respuesta_final = event.content.parts[0].text
+            respuesta_final = event.content.parts[-1].text
 
     return respuesta_final
 

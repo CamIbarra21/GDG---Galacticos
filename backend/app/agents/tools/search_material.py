@@ -1,39 +1,55 @@
-# Tool de ejemplo para el agente ADK.
-# Nota: esta tool trabaja 100% contra datos locales (sin llamadas externas),
-# para que el modo "local" siga siendo genuinamente offline.
+"""
+Tool del agente ADK: busca material educativo en la base de conocimiento
+construida localmente a partir de los PDFs (ver app/services/knowledge_base.py
+y app/scripts/build_kb.py).
 
-# Reemplazar esto por una consulta real a la base de datos / archivos del
-# currículo MINEDU preprocesado (ver backend/app/db/seed_data/).
-_MATERIALES_DEMO = {
-    "fracciones": (
-        "Una fracción representa una parte de un todo dividido en partes "
-        "iguales. Ejemplo: si una pizza se divide en 4 partes iguales y "
-        "comes 1, comiste 1/4 de la pizza."
-    ),
-    "suma": (
-        "Sumar es juntar cantidades. Ejemplo: si tienes 3 manzanas y te dan "
-        "2 más, ahora tienes 3 + 2 = 5 manzanas."
-    ),
-}
+Esta tool trabaja 100% contra el índice local (sin llamadas externas), para
+que el modo "local" siga siendo genuinamente offline.
+"""
+
+from app.services import knowledge_base
 
 
-def buscar_material(tema: str) -> dict:
-    """Busca material educativo guardado localmente sobre un tema dado.
+def buscar_material(consulta: str) -> dict:
+    """Busca en el material educativo local (extraído de los cuadernillos PDF)
+    fragmentos relevantes para responder la pregunta del estudiante.
 
     Args:
-        tema (str): el tema o concepto que el estudiante quiere aprender,
-            por ejemplo "fracciones" o "suma".
+        consulta (str): la pregunta o tema que el estudiante quiere aprender,
+            por ejemplo "¿qué es una fracción?" o "sumas con llevada".
 
     Returns:
-        dict: status ("success" o "not_found") y el contenido encontrado.
+        dict: status ("success" o "not_found") y una lista de fragmentos
+            encontrados, cada uno con su texto, tema, materia, grado y
+            el archivo/página de origen (para poder citar la fuente).
     """
-    tema_normalizado = tema.strip().lower()
-    contenido = _MATERIALES_DEMO.get(tema_normalizado)
-
-    if contenido is None:
+    try:
+        resultados = knowledge_base.search(consulta, top_k=3)
+    except FileNotFoundError as e:
         return {
-            "status": "not_found",
-            "message": f"No se encontró material local sobre '{tema}'.",
+            "status": "error",
+            "message": (
+                "El índice de materiales aún no ha sido construido. "
+                f"Detalle: {e}"
+            ),
         }
 
-    return {"status": "success", "tema": tema_normalizado, "contenido": contenido}
+    if not resultados:
+        return {
+            "status": "not_found",
+            "message": f"No se encontró material local relacionado con: '{consulta}'.",
+        }
+
+    return {
+        "status": "success",
+        "fragmentos": [
+            {
+                "texto": r["texto"],
+                "tema": r["tema"],
+                "materia": r["materia"],
+                "grado": r["grado"],
+                "fuente": f"{r['archivo']}, página {r['pagina']}",
+            }
+            for r in resultados
+        ],
+    }

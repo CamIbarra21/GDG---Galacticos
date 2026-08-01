@@ -49,7 +49,14 @@ async def chat(payload: ChatRequest) -> ChatResponse:
         new_message=contenido,
     ):
         if event.is_final_response() and event.content and event.content.parts:
-            respuesta_final = event.content.parts[-1].text #Respuesta
+            #respuesta_final = event.content.parts[-1].text #Respuesta
             #respuesta_final = event.content.parts[0].text #Razonamiento
+            textos = [
+                p.text
+                for p in event.content.parts
+                if getattr(p, "text", None) and not getattr(p, "thought", False)
+            ]
+            if textos:
+                respuesta_final = "\n".join(textos)
 
     return ChatResponse(reply=respuesta_final, mode=settings.mode)
