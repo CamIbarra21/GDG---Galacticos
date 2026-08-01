@@ -1,26 +1,30 @@
 """
-Base de conocimiento construida a partir de los PDFs en storage/materiales/.
+Base de conocimiento construida a partir de los materiales registrados en
+la base de datos (tabla `materials`), no escaneando carpetas directamente.
 
 Flujo:
-  1. build_index()  -> lee todos los PDFs, extrae texto, los divide en chunks,
-                        arma un índice TF-IDF y lo guarda en disco.
-  2. load_index()   -> carga ese índice ya construido (rápido, para usar en
-                        producción / durante el chat).
-  3. search(query)  -> busca los chunks más relevantes para una pregunta.
+  1. build_index_from_db(db) -> por cada Material en la BD:
+       - se asegura que el PDF exista localmente (lo descarga de url_web
+         si falta, ver app/services/file_utils.py)
+       - extrae el texto con PyMuPDF, lo divide en chunks
+       - reemplaza sus MaterialChunk viejos en la BD por los nuevos
+     Al final, arma el índice de búsqueda TF-IDF y lo guarda en disco.
+  2. load_index() / search(query) -> igual que antes, para el chatbot.
 
-Todo esto corre 100% local (sin internet), usando PyMuPDF para leer PDFs y
-scikit-learn (TF-IDF) para la búsqueda por similitud de texto. No se
-requiere ningún modelo de embeddings pesado ni conexión externa.
+Todo corre local (sin internet) EXCEPTO el paso de descarga, que solo
+ocurre una vez durante este preprocesamiento si el archivo aún no existe.
 """
 
 import json
 import pickle
-from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import fitz  # PyMuPDF
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+from app.db.models import Material, MaterialChunk
+from app.services.file_utils import asegurar_archivo_local
 
 MATERIALES_DIR = Path(__file__).resolve().parent.parent.parent / "storage" / "materiales"
 INDEX_PATH = Path(__file__).resolve().parent.parent.parent / "storage" / "index" / "kb_index.pkl"
@@ -28,42 +32,10 @@ INDEX_PATH = Path(__file__).resolve().parent.parent.parent / "storage" / "index"
 CHUNK_MAX_CHARS = 900
 CHUNK_OVERLAP = 150
 
-
-@dataclass
-class Chunk:
-    id: str
-    grado: str
-    materia: str
-    tema: str
-    pagina: int
-    archivo: str  # nombre del PDF de origen (para citar la fuente)
-    texto: str
-
-
-def _iter_pdfs(materiales_dir: Path):
-    """Recorre storage/materiales/<grado>/<materia>/*.pdf"""
-    if not materiales_dir.exists():
-        return
-    for grado_dir in sorted(materiales_dir.iterdir()):
-        if not grado_dir.is_dir():
-            continue
-        for materia_dir in sorted(grado_dir.iterdir()):
-            if not materia_dir.is_dir():
-                continue
-            for pdf_path in sorted(materia_dir.glob("*.pdf")):
-                yield pdf_path, grado_dir.name, materia_dir.name
-
-
 def _load_topic_map(pdf_path: Path) -> dict:
     """
     Carga un mapeo opcional tema -> [pagina_inicio, pagina_fin] desde un
     archivo .topics.json al lado del PDF. Si no existe, se usa tema "general".
-
-    Ejemplo de archivo (cuadernillo-matematica-1-2026.topics.json):
-    {
-        "numeros_del_1_al_10": [1, 8],
-        "sumas_simples": [9, 20]
-    }
     """
     topics_path = pdf_path.with_suffix("").with_suffix(".topics.json")
     if topics_path.exists():
@@ -90,7 +62,6 @@ def _split_long_text(texto: str, max_chars: int, overlap: int) -> list[str]:
     start = 0
     while start < len(texto):
         end = start + max_chars
-        # intenta cortar en el último espacio antes del límite
         if end < len(texto):
             corte = texto.rfind(" ", start, end)
             if corte != -1 and corte > start:
@@ -102,19 +73,40 @@ def _split_long_text(texto: str, max_chars: int, overlap: int) -> list[str]:
     return fragments
 
 
-def build_index(materiales_dir: Path = MATERIALES_DIR, index_path: Path = INDEX_PATH) -> int:
-    """Construye el índice de búsqueda a partir de todos los PDFs encontrados.
+def build_index_from_db(db, index_path: Path = INDEX_PATH) -> int:
+    """Reconstruye los chunks de cada material (desde su PDF) y el índice
+    de búsqueda TF-IDF. Devuelve la cantidad total de chunks indexados.
 
-    Devuelve la cantidad de chunks indexados.
+    Debe correrse cada vez que agregas un material nuevo o cambias un PDF.
     """
-    chunks: list[Chunk] = []
+    materiales = db.query(Material).all()
 
-    for pdf_path, grado, materia in _iter_pdfs(materiales_dir):
+    if not materiales:
+        print("No hay materiales registrados en la BD. Corre primero "
+              "seed_materials.py.")
+        _guardar_indice_vacio(index_path)
+        return 0
+
+    total_chunks_creados = 0
+
+    for material in materiales:
+        print(f"Procesando: {material.titulo}")
+
+        disponible = asegurar_archivo_local(material.ruta_local, material.url_web)
+        if not disponible:
+            print(f"--> Saltando (sin archivo disponible): {material.titulo}")
+            continue
+
+        pdf_path = Path(material.ruta_local)
         topic_map = _load_topic_map(pdf_path)
-        doc = fitz.open(pdf_path)
 
+        # Borra los chunks viejos de este material antes de regenerarlos
+        db.query(MaterialChunk).filter_by(material_id=material.id).delete()
+
+        doc = fitz.open(pdf_path)
+        orden = 0
         for page_index in range(len(doc)):
-            page_num = page_index + 1  # 1-indexado, más natural para citar
+            page_num = page_index + 1
             texto_pagina = doc[page_index].get_text().strip()
             if not texto_pagina:
                 continue
@@ -122,43 +114,75 @@ def build_index(materiales_dir: Path = MATERIALES_DIR, index_path: Path = INDEX_
             tema = _tema_for_page(topic_map, page_num)
             fragmentos = _split_long_text(texto_pagina, CHUNK_MAX_CHARS, CHUNK_OVERLAP)
 
-            for i, fragmento in enumerate(fragmentos):
-                chunk_id = f"{pdf_path.stem}_p{page_num}_{i}"
-                chunks.append(
-                    Chunk(
-                        id=chunk_id,
-                        grado=grado,
-                        materia=materia,
-                        tema=tema,
-                        pagina=page_num,
-                        archivo=pdf_path.name,
-                        texto=fragmento,
-                    )
+            for fragmento in fragmentos:
+                chunk = MaterialChunk(
+                    material_id=material.id,
+                    tema=tema,
+                    pagina=page_num,
+                    contenido=fragmento,
+                    orden=orden,
                 )
+                db.add(chunk)
+                orden += 1
+                total_chunks_creados += 1
         doc.close()
 
-    if not chunks:
-        index_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(index_path, "wb") as f:
-            pickle.dump({"vectorizer": None, "matrix": None, "chunks": []}, f)
-        return 0
+        print(f"  ✓ {orden} fragmentos generados")
 
-    textos = [c.texto for c in chunks]
+    db.commit()
+
+    _reconstruir_indice_busqueda(db, index_path)
+
+    return total_chunks_creados
+
+
+def _reconstruir_indice_busqueda(db, index_path: Path) -> None:
+    """Lee todos los MaterialChunk de la BD (ya actualizados) y arma el
+    índice TF-IDF que usa search() para responder rápido en el chat."""
+
+    filas = (
+        db.query(MaterialChunk, Material)
+        .join(Material, MaterialChunk.material_id == Material.id)
+        .all()
+    )
+
+    if not filas:
+        _guardar_indice_vacio(index_path)
+        return
+
+    chunks_info = []
+    textos = []
+    for chunk, material in filas:
+        chunks_info.append(
+            {
+                "chunk_id": chunk.id,
+                "material_id": material.id,
+                "titulo": material.titulo,
+                "materia": material.materia,
+                "grado": material.grado,
+                "tema": chunk.tema,
+                "pagina": chunk.pagina,
+                "archivo": Path(material.ruta_local).name if material.ruta_local else material.titulo,
+                "fuente": material.fuente,
+                "texto": chunk.contenido,
+            }
+        )
+        textos.append(chunk.contenido)
+
     vectorizer = TfidfVectorizer(max_features=5000)
     matrix = vectorizer.fit_transform(textos)
 
     index_path.parent.mkdir(parents=True, exist_ok=True)
     with open(index_path, "wb") as f:
         pickle.dump(
-            {
-                "vectorizer": vectorizer,
-                "matrix": matrix,
-                "chunks": [asdict(c) for c in chunks],
-            },
-            f,
+            {"vectorizer": vectorizer, "matrix": matrix, "chunks": chunks_info}, f
         )
 
-    return len(chunks)
+
+def _guardar_indice_vacio(index_path: Path) -> None:
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(index_path, "wb") as f:
+        pickle.dump({"vectorizer": None, "matrix": None, "chunks": []}, f)
 
 
 def load_index(index_path: Path = INDEX_PATH) -> dict:

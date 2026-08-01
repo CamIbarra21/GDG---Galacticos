@@ -7,3 +7,5 @@ venv/
 *.db
 .pytest_cache/
 storage/materiales/
+*.db
+*.sqlite3

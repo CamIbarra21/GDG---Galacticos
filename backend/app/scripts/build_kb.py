@@ -9,21 +9,25 @@ usará el chatbot. Vuelve a correr este script cada vez que agregues
 o modifiques un PDF.
 """
 
-from app.services.knowledge_base import build_index, MATERIALES_DIR, INDEX_PATH
-
+from app.db.database import SessionLocal
+from app.services.knowledge_base import build_index_from_db, INDEX_PATH
 
 def main():
-    print(f"Buscando PDFs en: {MATERIALES_DIR}")
-    total = build_index()
-    print(f"Índice construido: {total} fragmentos (chunks) indexados.")
+    db = SessionLocal()
+    try:
+        total = build_index_from_db(db)
+    finally:
+        db.close()
+    
+    print(f"\nÍndice construido: {total} fragmentos (chunks) indexados.")
     print(f"Guardado en: {INDEX_PATH}")
-
+    
     if total == 0:
         print(
-            "\nNo se encontró ningún PDF. Verifica que tus archivos estén en:\n"
-            "  storage/materiales/<grado>/<materia>/tu_archivo.pdf\n"
-            "Ejemplo: storage/materiales/primaria_primero/matematica/"
-            "cuadernillo-matematica-1-2026.pdf"
+            "\nNo se genero ningun fragmento. Verifica que:\n"
+            "  1. Hayas corrido 'python -m app.db.seed_materials' antes.\n"
+            "  2. Los PDFs existan en su 'ruta_local' o tengan un 'url_web' "
+            "valido registrado en la tabla materials."
         )
 
 
